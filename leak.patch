@@ -1,0 +1,1000 @@
+
+-               if ((dd = malloc(sizeof(*dd))) == NULL)
++               if ((dd = calloc(1, sizeof(*dd))) == NULL)
+
+	-               if (dd->x == NULL)                                      \
++               if (dd->x == NULL) {                                    \
++                       devinfo_free_dev(dd);                           \
+                        return(ENOMEM);                                 \
+-               if (walker + strnlen(walker, ep - walker) >= ep)        \
++               }                                                       \
++               if (walker + strnlen(walker, ep - walker) >= ep) {      \
++                       devinfo_free_dev(dd);                           \
+                        return(EINVAL);                                \
++               }                                                       \
+
+
+	+/*
++ * Free an individual dev.
++ */
++static void
++devinfo_free_dev(struct devinfo_i_dev *dd)
++{
++       free(dd->dd_name);
++       free(dd->dd_desc);
++       free(dd->dd_drivername);
++       free(dd->dd_pnpinfo);
++       free(dd->dd_location);
++       free(dd);
++}
++
+
+ /*
+  * Free the list contents.
+  */
+@@ -376,12 +395,7 @@ devinfo_free(void)
+
+        while ((dd = TAILQ_FIRST(&devinfo_dev)) != NULL) {
+                TAILQ_REMOVE(&devinfo_dev, dd, dd_link);
+-               free(dd->dd_name);
+-               free(dd->dd_desc);
+-               free(dd->dd_drivername);
+-               free(dd->dd_pnpinfo);
+-               free(dd->dd_location);
+-               free(dd);
++               devinfo_free_dev(dd);
+        }
+
+--- a/sys/vm/vm.h
++++ b/sys/vm/vm.h
+@@ -150,13 +150,15 @@ extern int old_mlock;
+
+ extern int vm_ndomains;
+
++#ifdef _KERNEL
+ struct ucred;
+-int swap_reserve(vm_ooffset_t incr);
+-int swap_reserve_by_cred(vm_ooffset_t incr, struct ucred *cred);
++bool swap_reserve(vm_ooffset_t incr);
++bool swap_reserve_by_cred(vm_ooffset_t incr, struct ucred *cred);
+ void swap_reserve_force(vm_ooffset_t incr);
+ void swap_release(vm_ooffset_t decr);
+ void swap_release_by_cred(vm_ooffset_t decr, struct ucred *cred);
+ void swapper(void);
++#endif
+
+ #endif                         /* VM_H */
+
+-int
++static bool
++swap_reserve_by_cred_rlimit(u_long pincr, struct ucred *cred, int oc)
++{
++       struct uidinfo *uip;
++       u_long prev;
++
++       uip = cred->cr_ruidinfo;
++
++       prev = atomic_fetchadd_long(&uip->ui_vmsize, pincr);
++       if ((oc & SWAP_RESERVE_RLIMIT_ON) != 0 &&
++           prev + pincr > lim_cur(curthread, RLIMIT_SWAP) &&
++           priv_check(curthread, PRIV_VM_SWAP_NORLIMIT) != 0) {
++               prev = atomic_fetchadd_long(&uip->ui_vmsize, -pincr);
++               KASSERT(prev >= pincr, ("negative vmsize for uid = %d\n", uip->ui_uid));
++               return (false);
++       }
++       return (true);
++}
++
++static void
++swap_release_by_cred_rlimit(u_long pdecr, struct ucred *cred)
++{
++       struct uidinfo *uip;
++#ifdef INVARIANTS
++       u_long prev;
++#endif
++
++       uip = cred->cr_ruidinfo;
++
++#ifdef INVARIANTS
++       prev = atomic_fetchadd_long(&uip->ui_vmsize, -pdecr);
++       KASSERT(prev >= pdecr, ("negative vmsize for uid = %d\n", uip->ui_uid));
++#else
++       atomic_subtract_long(&uip->ui_vmsize, pdecr);
++#endif
++}
++
++static void
++swap_reserve_force_rlimit(u_long pincr, struct ucred *cred)
++{
++       struct uidinfo *uip;
++
+:
+
++
++       uip = cred->cr_ruidinfo;
++       atomic_add_long(&uip->ui_vmsize, pincr);
++}
++
++bool
+ swap_reserve(vm_ooffset_t incr)
+ {
+
+        return (swap_reserve_by_cred(incr, curthread->td_ucred));
+ }
+
+-int
++bool
+ swap_reserve_by_cred(vm_ooffset_t incr, struct ucred *cred)
+ {
+        u_long r, s, prev, pincr;
+-       int res, error;
++#ifdef RACCT
++       int error;
++#endif
++       int oc;
+        static int curfail;
+        static struct timeval lastfail;
+-       struct uidinfo *uip;
+-
+-       uip = cred->cr_ruidinfo;
+
+        KASSERT((incr & PAGE_MASK) == 0, ("%s: incr: %ju & PAGE_MASK", __func__,
+            (uintmax_t)incr));
+
+ #ifdef RACCT
+-       if (racct_enable) {
++       if (RACCT_ENABLED()) {
+                PROC_LOCK(curproc);
+                error = racct_add(curproc, RACCT_SWAP, incr);
+                PROC_UNLOCK(curproc);
+                if (error != 0)
+-                       return (0);
++                       return (false);
+        }
+ #endif
+
+
+        pincr = atop(incr);
+-       res = 0;
+        prev = atomic_fetchadd_long(&swap_reserved, pincr);
+        r = prev + pincr;
+-       if (overcommit & SWAP_RESERVE_ALLOW_NONWIRED) {
+-               s = vm_cnt.v_page_count - vm_cnt.v_free_reserved -
++       s = swap_total;
++       oc = atomic_load_int(&overcommit);
++       if (r > s && (oc & SWAP_RESERVE_ALLOW_NONWIRED) != 0) {
++               s += vm_cnt.v_page_count - vm_cnt.v_free_reserved -
+                    vm_wire_count();
+-       } else
+-               s = 0;
+-       s += swap_total;
+-       if ((overcommit & SWAP_RESERVE_FORCE_ON) == 0 || r <= s ||
+-           (error = priv_check(curthread, PRIV_VM_SWAP_NOQUOTA)) == 0) {
+-               res = 1;
+-       } else {
++       }
++       if ((oc & SWAP_RESERVE_FORCE_ON) != 0 && r > s &&
++           priv_check(curthread, PRIV_VM_SWAP_NOQUOTA) != 0) {
+                prev = atomic_fetchadd_long(&swap_reserved, -pincr);
+-               if (prev < pincr)
+-                       panic("swap_reserved < incr on overcommit fail");
+-       }
+-       if (res) {
+-               prev = atomic_fetchadd_long(&uip->ui_vmsize, pincr);
+-               if ((overcommit & SWAP_RESERVE_RLIMIT_ON) != 0 &&
+-                   prev + pincr > lim_cur(curthread, RLIMIT_SWAP) &&
+-                   priv_check(curthread, PRIV_VM_SWAP_NORLIMIT)) {
+-                       res = 0;
+-                       prev = atomic_fetchadd_long(&uip->ui_vmsize, -pincr);
+-                       if (prev < pincr)
+-                               panic("uip->ui_vmsize < incr on overcommit fail");
+-               }
++               KASSERT(prev >= pincr, ("swap_reserved < incr on overcommit fail"));
++               goto out_error;
+        }
+-       if (!res && ppsratecheck(&lastfail, &curfail, 1)) {
+-               printf("uid %d, pid %d: swap reservation for %jd bytes failed\n",
+:
+-                   uip->ui_uid, curproc->p_pid, incr);
++
++       if (!swap_reserve_by_cred_rlimit(pincr, cred, oc)) {
++               prev = atomic_fetchadd_long(&swap_reserved, -pincr);
++               KASSERT(prev >= pincr, ("swap_reserved < incr on overcommit fail"));
++               goto out_error;
+        }
+
++       return (true);
++
++out_error:
++       if (ppsratecheck(&lastfail, &curfail, 1)) {
++               printf("uid %d, pid %d: swap reservation for %jd bytes failed\n",
++                   cred->cr_ruidinfo->ui_uid, curproc->p_pid, incr);
++       }
+ #ifdef RACCT
+-       if (racct_enable && !res) {
++       if (RACCT_ENABLED()) {
+                PROC_LOCK(curproc);
+                racct_sub(curproc, RACCT_SWAP, incr);
+                PROC_UNLOCK(curproc);
+        }
+ #endif
+
+-       return (res);
++       return (false);
+ }
+
+ void
+ swap_reserve_force(vm_ooffset_t incr)
+ {
+-       struct uidinfo *uip;
+        u_long pincr;
+
+        KASSERT((incr & PAGE_MASK) == 0, ("%s: incr: %ju & PAGE_MASK", __func__,
+            (uintmax_t)incr));
+
+-       PROC_LOCK(curproc);
+ #ifdef RACCT
+-       if (racct_enable)
++       if (RACCT_ENABLED()) {
+	+               PROC_LOCK(curproc);
+                racct_add_force(curproc, RACCT_SWAP, incr);
++               PROC_UNLOCK(curproc);
++       }
+ #endif
+        pincr = atop(incr);
+        atomic_add_long(&swap_reserved, pincr);
+-       uip = curproc->p_ucred->cr_ruidinfo;
+-       atomic_add_long(&uip->ui_vmsize, pincr);
+-       PROC_UNLOCK(curproc);
++       swap_reserve_force_rlimit(pincr, curthread->td_ucred);
+ }
+
+
+ -                           stcb, net, SCTP_FROM_SCTP_INDATA + SCTP_LOC_29);
++                           stcb, net, SCTP_FROM_SCTP_INDATA + SCTP_LOC_30);
+                        net->partial_bytes_acked = 0;
+                        net->flight_size = 0;
+                }
+@@ -4780,14 +4789,14 @@ sctp_handle_sack(struct mbuf *m, int offset_seg, int offset_dup,
+                        if (net->new_pseudo_cumack)
+                                sctp_timer_stop(SCTP_TIMER_TYPE_SEND, stcb->sctp_ep,
+                                    stcb, net,
+-                                   SCTP_FROM_SCTP_INDATA + SCTP_LOC_30);
++                                   SCTP_FROM_SCTP_INDATA + SCTP_LOC_31);
+
+
+-       int bad = 0, defset, hostset;
++       int defset, hostset;
++       long bad = 0;
+
+
+-       if (pmap_initialized)
++       if (pmap_initialized) {
++               pmap_qremove(va, atop(size));
+                kva_free(va, size);
++       }
+
+
+                        printf("%s%s: %s:\n",
+                                out_prefix ? out_prefix : "",
+                                nodetype_str(node), remap);
+-               (*out_header_flag)++;
++               if (out_header_flag)
++                       (*out_header_flag)++;
+                free(remap);
+        }
+
+
+	-       listen(sockfd, 1);
++       if (listen(sockfd, 1)) {
++               perror("listen() failed");
++               close(sockfd);
++               return NULL;
++       }
+
+
+-       return !!(addr[(nr / BITS_PER_LONG)] & (1 <<  (nr % BITS_PER_LONG)));
++       return !!(addr[(nr / BITS_PER_LONG)] & (1UL << (nr % BITS_PER_LONG)));
+
+
+-       inet_pton(AF_INET6, dst, &sib->sib_addr);
+-       return 0;
++       return inet_pton(AF_INET6, dst, &sib->sib_addr) != 1;
+
+
+-       cl_spinlock_init(&pm->lock);
++       status = cl_spinlock_init(&pm->lock);
++       if (status != IB_SUCCESS)
++               goto Exit;
+
+
+-       if (!p_physp)
++       if (!p_physp) {
++               osm_port_delete(&p_port);
+                return NULL;
++       }
+
+
+                /* First set it's parent if needed */
+-               if (i <= nparents)
++               if (i < nparents)
+                        clk_set_assigned_parent(dev, clk, i);
+
+                /* Then set a new frequency */
+-               if (i <= nrates && rates[i] != 0)
++               if (i < nrates && rates[i] != 0)
+                        clk_set_assigned_rates(dev, clk, rates[i]);
+
+                clk_release(clk);
+        }
++       if (rates != NULL)
++               OF_prop_free(rates);
+
+        return (0);
+
+
+	-                       if (rc != 0)
++                       if (rc != 0) {
++                               nvlist_destroy(kids);
+                                return (rc);
++                       }
+
+
+-               nvlist_next(kids);
++               rc = nvlist_next(kids);
++               if (rc != 0)
++                       break;
+        }
+
+
+	                /*
+                 * Release any swap space and free any whole pages.
+                 */
+-               if (newpages < oldpages) {
+-                       swap_pager_freespace(uobj, newpages, oldpages -
+-                           newpages);
++               if (newpages < oldpages)
+                        vm_object_page_remove(uobj, newpages, 0, 0);
+-               }
+        }
+
+
+
+-inline static uint32_t
++inline static void
+ dwc_setup_txdesc(struct dwc_softc *sc, int idx, bus_addr_t paddr,
+     uint32_t len)
+ {
+
+	-       uint32_t flags;
+-       uint32_t nidx;
+-
+-       nidx = next_txidx(sc, idx);
++       uint32_t desc0, desc1;
+
+        /* Addr/len 0 means we're clearing the descriptor after xmit done. */
+        if (paddr == 0 || len == 0) {
+-               flags = 0;
++               desc0 = 0;
++               desc1 = 0;
+                --sc->txcount;
+        } else {
+-               if (sc->mactype != DWC_GMAC_EXT_DESC)
+-                       flags = NTDESC1_TCH | NTDESC1_FS
+-                           | NTDESC1_LS | NTDESC1_IC;
+-               else
+-                       flags = ETDESC0_TCH | ETDESC0_FS | ETDESC0_LS |
+-                                   ETDESC0_IC;
++               if (sc->mactype != DWC_GMAC_EXT_DESC) {
++                       desc0 = 0;
++                       desc1 = NTDESC1_TCH | NTDESC1_FS | NTDESC1_LS |
++                           NTDESC1_IC | len;
++               } else {
++                       desc0 = ETDESC0_TCH | ETDESC0_FS | ETDESC0_LS |
++                           ETDESC0_IC;
++                       desc1 = len;
++               }
+                ++sc->txcount;
+        }
+
+        sc->txdesc_ring[idx].addr1 = (uint32_t)(paddr);
+-       if (sc->mactype != DWC_GMAC_EXT_DESC) {
+-               sc->txdesc_ring[idx].desc0 = 0;
+-               sc->txdesc_ring[idx].desc1 = flags | len;
+-       } else {
+-               sc->txdesc_ring[idx].desc0 = flags;
+-               sc->txdesc_ring[idx].desc1 = len;
+-       }
++       sc->txdesc_ring[idx].desc0 = desc0;
++       sc->txdesc_ring[idx].desc1 = desc1;
+
+
+
+
++static struct mbuf *
++dwc_rxfinish_one(struct dwc_softc *sc, struct dwc_hwdesc *desc,
++    struct dwc_bufmap *map)
++{
++       struct ifnet *ifp;
++       struct mbuf *m, *m0;
++       int len;
++       uint32_t rdesc0;
++
++       m = map->mbuf;
++       ifp = sc->ifp;
++       rdesc0 = desc ->desc0;
++       /* Validate descriptor. */
++       if (rdesc0 & RDESC0_ES) {
++               /*
++                * Errored packet. Statistic counters are updated
++                * globally, so do nothing
++                */
++               return (NULL);
++       }
++
++       if ((rdesc0 & (RDESC0_FS | RDESC0_LS)) !=
++                   (RDESC0_FS | RDESC0_LS)) {
++               /*
++                * Something very wrong happens. The whole packet should be
++                * recevied in one descriptr. Report problem.
++                */
++               device_printf(sc->dev,
++                   "%s: RX descriptor without FIRST and LAST bit set: 0x%08X",
++                   __func__, rdesc0);
++               return (NULL);
++       }
++
++       len = (rdesc0 >> RDESC0_FL_SHIFT) & RDESC0_FL_MASK;
++       if (len < 64) {
++               /*
++                * Lenght is invalid, recycle old mbuf
++                * Probably impossible case
+:
+
+
+        for (;;) {
+                idx = sc->rx_idx;
+-
+-               rdes0 = sc->rxdesc_ring[idx].desc0;
+-               if ((rdes0 & RDESC0_OWN) != 0)
++               desc = sc->rxdesc_ring + idx;
++               if ((desc->desc0 & RDESC0_OWN) != 0)
+                        break;
+
+-               bus_dmamap_sync(sc->rxbuf_tag, sc->rxbuf_map[idx].map,
+-                   BUS_DMASYNC_POSTREAD);
+-               bus_dmamap_unload(sc->rxbuf_tag, sc->rxbuf_map[idx].map);
+-
+-               len = (rdes0 >> RDESC0_FL_SHIFT) & RDESC0_FL_MASK;
+-               if (len != 0) {
+-                       m = sc->rxbuf_map[idx].mbuf;
+-                       m->m_pkthdr.rcvif = ifp;
+-                       m->m_pkthdr.len = len;
+-                       m->m_len = len;
+-                       if_inc_counter(ifp, IFCOUNTER_IPACKETS, 1);
+-
+-                       /* Remove trailing FCS */
+-                       m_adj(m, -ETHER_CRC_LEN);
+-
+-                       DWC_UNLOCK(sc);
+-                       (*ifp->if_input)(ifp, m);
+-                       DWC_LOCK(sc);
++               m = dwc_rxfinish_one(sc, desc, sc->rxbuf_map + idx);
++               if (m == NULL) {
++                       wmb();
++                       desc->desc0 = RDESC0_OWN;
++                       wmb();
+                } else {
+-                       /* XXX Zero-length packet ? */
++                       /* We cannot create hole in RX ring */
+
+
+
++       case IEEE80211_IOC_UAPSD:
++               if ((vap->iv_caps & IEEE80211_C_UAPSD) == 0)
++                       return EOPNOTSUPP;
++               if (ireq->i_val == 0)
++                       vap->iv_flags_ext &= ~IEEE80211_FEXT_UAPSD;
++               else if (ireq->i_val == 1)
++                       vap->iv_flags_ext |= IEEE80211_FEXT_UAPSD;
++               else
++                       return EINVAL;
++               break;
+
+
+-ieee80211_add_wme_info(uint8_t *frm, struct ieee80211_wme_state *wme)
++ieee80211_add_wme_info(uint8_t *frm, struct ieee80211_wme_state *wme,
++    struct ieee80211_node *ni)
+ {
+-       static const struct ieee80211_wme_info info = {
+-               .wme_id         = IEEE80211_ELEMID_VENDOR,
+-               .wme_len        = sizeof(struct ieee80211_wme_info) - 2,
+-               .wme_oui        = { WME_OUI_BYTES },
+-               .wme_type       = WME_OUI_TYPE,
+-               .wme_subtype    = WME_INFO_OUI_SUBTYPE,
+-               .wme_version    = WME_VERSION,
+-               .wme_info       = 0,
+-       };
+-       memcpy(frm, &info, sizeof(info));
+-       return frm + sizeof(info);
++       static const uint8_t oui[4] = { WME_OUI_BYTES, WME_OUI_TYPE };
++       struct ieee80211vap *vap = ni->ni_vap;
++
++       *frm++ = IEEE80211_ELEMID_VENDOR;
++       *frm++ = sizeof(struct ieee80211_wme_info) - 2;
++       memcpy(frm, oui, sizeof(oui));
++       frm += sizeof(oui);
++       *frm++ = WME_INFO_OUI_SUBTYPE;
++       *frm++ = WME_VERSION;
++
++       /* QoS info field depends upon operating mode */
++       switch (vap->iv_opmode) {
++       case IEEE80211_M_HOSTAP:
++               *frm = wme->wme_bssChanParams.cap_info;
++               if (vap->iv_flags_ext & IEEE80211_FEXT_UAPSD)
++                       *frm |= WME_CAPINFO_UAPSD_EN;
++               frm++;
++               break;
++       case IEEE80211_M_STA:
++               /*
++                * NB: UAPSD drivers must set this up in their
++                * VAP creation method.
++                */
++               *frm++ = vap->iv_uapsdinfo;
++               break;
++       default:
++               *frm++ = 0;
++               break;
+
+
+
+ void
+ remove_protocol(struct protocol *proto)
+ {
+-       struct protocol *p, *next;
++       struct protocol *p, *prev;
+
+-       for (p = protocols; p; p = next) {
+-               next = p->next;
++       for (p = protocols, prev = NULL; p != NULL; prev = p, p = p->next) {
+                if (p == proto) {
+-                       protocols = p->next;
++                       if (prev == NULL)
++                               protocols = p->next;
++                       else
++                               prev->next = p->next;
+                        free(p);
++                       break;
+                }
+        }
+ }
+
+
+
+ -       child = __archive_create_child(cmd, &state->child_stdin,
+-           &state->child_stdout);
+-       if (child == -1) {
++       ret = __archive_create_child(cmd, &state->child_stdin,
++           &state->child_stdout, &state->child);
++       if (ret != ARCHIVE_OK) {
+
+
++static int string_is_numeric (const char* value)
++{
++       size_t len = strlen(value);
++       size_t i;
++
++       if (len == 0) {
++               return (ARCHIVE_WARN);
++       }
++       else if (len == 1 && !(value[0] >= '0' && value[0] <= '9')) {
++               return (ARCHIVE_WARN);
++       }
++       else if (!(value[0] >= '0' && value[0] <= '9') &&
++                value[0] != '-' && value[0] != '+') {
++               return (ARCHIVE_WARN);
++       }
++
++       for (i = 1; i < len; i++) {
++               if (!(value[i] >= '0' && value[i] <= '9')) {
++                       return (ARCHIVE_WARN);
++               }
++       }
++
++       return (ARCHIVE_OK);
++}
++
+
+
+-pid_t
+-__archive_create_child(const char *cmd, int *child_stdin, int *child_stdout)
++int
++__archive_create_child(const char *cmd, int *child_stdin, int *child_stdout,
++               HANDLE *out_child)
+ {
+        HANDLE childStdout[2], childStdin[2],childStderr;
+        SECURITY_ATTRIBUTES secAtts;
+@@ -44,6 +45,7 @@ __archive_create_child(const char *cmd, int *child_stdin, int *child_stdout)
+        char *arg0, *ext;
+        int i, l;
+        DWORD fl, fl_old;
++       HANDLE child;
+
+        childStdout[0] = childStdout[1] = INVALID_HANDLE_VALUE;
+        childStdin[0] = childStdin[1] = INVALID_HANDLE_VALUE;
+@@ -154,13 +156,20 @@ __archive_create_child(const char *cmd, int *child_stdin, int *child_stdout)
+        *child_stdout = _open_osfhandle((intptr_t)childStdout[0], _O_RDONLY);
+        *child_stdin = _open_osfhandle((intptr_t)childStdin[1], _O_WRONLY);
+
++       child = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE,
++               childInfo.dwProcessId);
++       if (child == NULL) // INVALID_HANDLE_VALUE ?
++               goto fail;
++
++       *out_child = child;
++
+        CloseHandle(childStdout[1]);
+        CloseHandle(childStdin[0]);
+
+        archive_string_free(&cmdline);
+        archive_string_free(&fullpath);
+        __archive_cmdline_free(acmd);
+-       return (childInfo.dwProcessId);
++       return ARCHIVE_OK;
+
+ fail:
+        if (childStdout[0] != INVALID_HANDLE_VALUE)
+@@ -176,7 +185,7 @@ __archive_create_child(const char *cmd, int *child_stdin, int *child_stdout)
+        archive_string_free(&cmdline);
+        archive_string_free(&fullpath);
+        __archive_cmdline_free(acmd);
+-       return (-1);
++       return ARCHIVE_FAILED;
+ }
+
+
+ +static void
++badalloc(const char *message)
++{
++       write(2, message, strlen(message));
++       abort();
++}
++
+ /*
+  * Like malloc, but returns an error when out of space.
+  */
+@@ -59,9 +66,9 @@ ckmalloc(size_t nbytes)
+ {
+        pointer p;
+
+-       INTOFF;
++       if (!is_int_on())
++               badalloc("Unsafe ckmalloc() call\n");
+        p = malloc(nbytes);
+-       INTON;
+        if (p == NULL)
+                error("Out of space");
+        return p;
+
+
+
+	#define write(fd,buf,len) send((fd),(buf),(int)(len),0)
+#define read(fd,buf,len) recv((fd),(buf),(int)(len),0)
+
+
+ passthru(const struct cmd *f, int argc, char *argv[])
+ {
+        int     fd = -1, ifd = -1;
++       size_t  bytes_read;
+        void    *data = NULL, *metadata = NULL;
+        struct nvme_pt_command  pt;
+
+-       arg_parse(argc, argv, f);
++       if (arg_parse(argc, argv, f))
++               return;
+        open_dev(argv[optind], &fd, 1, 1);
+
+        if (opt.read && opt.write)
+@@ -189,8 +191,12 @@ passthru(const struct cmd *f, int argc, char *argv[])
+                        goto cleanup;
+                }
+                memset(data, opt.prefill, opt.data_len);
+-               if (opt.write && read(ifd, data, opt.data_len) < 0) {
+-                       warn("read %s", *opt.ifn ? opt.ifn : "stdin");
++               if (opt.write &&
++                   (bytes_read = read(ifd, data, opt.data_len)) !=
++                   opt.data_len) {
++                       warn("read %s; expected %u bytes; got %zd",
++                            *opt.ifn ? opt.ifn : "stdin",
++                            opt.data_len, bytes_read);
+                        goto cleanup;
+                }
+        }
+@@ -249,6 +255,10 @@ passthru(const struct cmd *f, int argc, char *argv[])
+                }
+        }
+ cleanup:
++       free(data);
++       close(fd);
++       if (ifd > -1)
++               close(ifd);
+        if (errno)
+                exit(1);
+ }
+
+
+ -               sfs = malloc(sizeof *sfs, M_TEMP, M_WAITOK | M_ZERO);
++               sfs = malloc(sizeof(*sfs), M_SENDFILE, M_WAITOK | M_ZERO);
+
+
+                if (!vector_str_push(&v.ext_name, ddata->cur, len))
+-                       return (0);
++                       goto clean;
+
+
+-       if (diep != NULL)
+-               *diep = die;
++       *diep = die;
+
+
+
+ fail:
+        free(sockshost);
+-       if (sd >= 0)
++       /* Fully close if it was opened; otherwise just don't leak the fd. */
++       if (conn != NULL)
++               fetch_close(conn);
++       else if (sd >= 0)
+                close(sd);
+        if (cais != NULL)
+                freeaddrinfo(cais);
+
+
+		-       if (*host == NULL)
+-               goto fail;
++       if (*host == NULL) {
++               fprintf(stderr, "Failure to allocate memory, exiting.\n");
++               return (-1);
++       }
+
+
+-       if (*host == NULL)
+-               goto fail;
++       if (*host == NULL) {
++               fprintf(stderr, "Failure to allocate memory, exiting.\n");
++               return (-1);
++       }
+        if (ext == NULL) {
+                *port = 1080; /* Default port as defined in RFC1928 */
+        } else {
+@@ -567,16 +569,14 @@ fetch_socks5_getenv(char **host, int *port)
+                *port = strtoimax(ext, (char **)&endptr, 10);
+                if (*endptr != '\0' || errno != 0 || *port < 0 ||
+                    *port > 65535) {
++                       free(*host);
++                       *host = NULL;
+                        socks5_seterr(SOCKS5_ERR_BAD_PORT);
+                        return (0);
+                }
+        }
+
+        return (2);
+-
+-fail:
+-       fprintf(stderr, "Failure to allocate memory, exiting.\n");
+-       return (-1);
+
+
+
+-       if (elftc_copyfile(infd, tmpfd) < 0)
++       if (elftc_copyfile(infd, tmpfd) < 0) {
++               (void) close(tmpfd);
+                return (-1);
++       }
+
+        /*
+         * Remove the temporary file from the file system
+         * namespace, and close its file descriptor.
+         */
+-       if (unlink(src) < 0)
++       if (unlink(src) < 0) {
++               (void) close(tmpfd);
+                return (-1);
++       }
+
+
++    char buf[5];                     /* for printing %B, %F, and %S */
+
+
++       struct ifaddr *rti_ifa = NULL;
+
+        ifp = ifa->ifa_ifp;
+
+@@ -1846,9 +1847,10 @@ ifa_maintain_loopback_route(int cmd, const char *otype, struct ifaddr *ifa,
+                /* explicitly specify (loopback) ifa */
+                if (info.rti_ifp != NULL) {
+                        NET_EPOCH_ENTER(et);
+-                       info.rti_ifa = ifaof_ifpforaddr(ifa->ifa_addr, info.rti_ifp);
+-                       if (info.rti_ifa != NULL)
+-                               ifa_ref(info.rti_ifa);
++                       rti_ifa = ifaof_ifpforaddr(ifa->ifa_addr, info.rti_ifp);
++                       if (rti_ifa != NULL)
++                               ifa_ref(rti_ifa);
++                       info.rti_ifa = rti_ifa;
+                        NET_EPOCH_EXIT(et);
+                }
+        }
+
+
+	        p = getpwd2();
+-       if (p != NULL)
++       if (p != NULL) {
++               INTOFF;
+                curdir = savestr(p);
++               INTON;
++       }
+
+
+-       if (cp == NULL)
+-               return ((struct servtab *)0);
++       if (cp == NULL) {
++               free(policy);
++               return (NULL);
++       }
++
+
+
+-               size_t linkbuffer_len = st->st_size + 1;
++               size_t linkbuffer_len = st->st_size;
+                char *linkbuffer;
+                int lnklen;
+
+-               linkbuffer = malloc(linkbuffer_len);
++               linkbuffer = malloc(linkbuffer_len + 1);
+                if (linkbuffer == NULL) {
+                        archive_set_error(&a->archive, ENOMEM,
+                            "Couldn't read link data");
+@@ -280,7 +280,7 @@ archive_read_disk_entry_from_file(struct archive *_a,
+                        free(linkbuffer);
+                        return (ARCHIVE_FAILED);
+                }
+-               linkbuffer[lnklen] = 0;
++               linkbuffer[lnklen] = '\0';
+                archive_entry_set_symlink(entry, linkbuffer);
+                free(linkbuffer);
+
+
+                        break;
+                case EXT_TIMEZONE:              /* Not supported */
+-               case EXT_UTF16_FILENAME:        /* Not supported */
+-               case EXT_UTF16_DIRECTORY:       /* Not supported */
++                      break;
+                default:
+                        break;
+
+
+			-       size_t hash_type;
++       size_t hash_type = 0;
+        size_t value_len;
+
+        if(!read_var_sized(a, &hash_type, &value_len))
+@@ -1303,7 +1306,7 @@ static int parse_file_extra_htime(struct archive_read* a,
+     struct archive_entry* e, struct rar5* rar, ssize_t* extra_data_size)
+ {
+        char unix_time = 0;
+-       size_t flags;
++       size_t flags = 0;
+
+
+-       if (NULL == archive_wstring_ensure(dest, dest->length + wcs_length + 1))
++       /*
++        * As we decided to have wcs_length == mbs_length == len
++        * we can use len here instead of wcs_length
++        */
++       if (NULL == archive_wstring_ensure(dest, dest->length + len + 1))
+
+
+-
+-       r1 = __archive_write_close_filter(f->next_filter);
+-       return (r1 < ret ? r1 : ret);
++       return ret;
+
+
+
+ archive_compressor_compress_close(struct archive_write_filter *f)
+ {
+        struct private_data *state = (struct private_data *)f->data;
+-       int ret, ret2;
++       int ret;
+
+        ret = output_code(f, state->cur_code);
+        if (ret != ARCHIVE_OK)
+-               goto cleanup;
++               return ret;
+        ret = output_flush(f);
+        if (ret != ARCHIVE_OK)
+-               goto cleanup;
++               return ret;
+
+        /* Write the last block */
+        ret = __archive_write_filter(f->next_filter,
+            state->compressed, state->compressed_offset);
+-cleanup:
+-       ret2 = __archive_write_close_filter(f->next_filter);
+-       if (ret > ret2)
+-               ret = ret2;
+-       free(state->compressed);
+-       free(state);
+        return (ret);
+ }
+
+ static int
+ archive_compressor_compress_free(struct archive_write_filter *f)
+ {
+-       (void)f; /* UNUSED */
++       struct private_data *state = (struct private_data *)f->data;
++
++       free(state->compressed);
++       free(state);
+        return (ARCHIVE_OK);
+ }
+
+
+
+ +       } else if (strcmp(key, "xattrheader") == 0) {
++               if (val == NULL || val[0] == 0) {
++                       archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++                           "pax: xattrheader requires a value");
++               } else if (strcmp(val, "ALL") == 0 ||
++                   strcmp(val, "all") == 0) {
++                       pax->flags |= WRITE_LIBARCHIVE_XATTR | WRITE_SCHILY_XATTR;
++                       ret = ARCHIVE_OK;
++               } else if (strcmp(val, "SCHILY") == 0 ||
++                   strcmp(val, "schily") == 0) {
++                       pax->flags |= WRITE_SCHILY_XATTR;
++                       pax->flags &= ~WRITE_LIBARCHIVE_XATTR;
++                       ret = ARCHIVE_OK;
++               } else if (strcmp(val, "LIBARCHIVE") == 0 ||
++                   strcmp(val, "libarchive") == 0) {
++                       pax->flags |= WRITE_LIBARCHIVE_XATTR;
++                       pax->flags &= ~WRITE_SCHILY_XATTR;
++                       ret = ARCHIVE_OK;
++               } else
++                       archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
++                           "pax: invalid xattr header name");
++               return (ret);
+        }
+
+
+
+	        if (path == NULL)
+                return (0);
+-       if (type == AE_IFDIR &&
+-           (path[0] == '\0' || path[strlen(path) - 1] != '/')) {
+-               return strlen(path) + 1;
+-       } else {
+-               return strlen(path);
+-       }
++       len = strlen(path);
++       if (type == AE_IFDIR && (path[0] == '\0' || path[len - 1] != '/'))
++               ++len; /* Space for the trailing / */
++       return len;
+ }
+
+
+ -       assertA(0 == archive_read_next_header(a, &ae));
+        /* This archive is invalid. However, processing it shouldn't cause any
+         * buffer overflow errors during reading rar5 tables. */
+-       assertA(archive_read_data(a, buf, sizeof(buf)) <= 0);
+
+-       /* This test only cares about not returning success here. */
+-       assertA(ARCHIVE_OK != archive_read_next_header(a, &ae));
++       (void) archive_read_next_header(a, &ae);
++       (void) archive_read_data(a, buf, sizeof(buf));
++       (void) archive_read_next_header(a, &ae);
+
+
+-       while(0 != archive_read_data(a, buf, sizeof(buf))) {}
++       while(0 < archive_read_data(a, buf, sizeof(buf))) {}
++
++       EPILOGUE();
