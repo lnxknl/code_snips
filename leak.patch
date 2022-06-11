@@ -998,3 +998,181 @@
 +       while(0 < archive_read_data(a, buf, sizeof(buf))) {}
 +
 +       EPILOGUE();
+
+
+
+        error = xfs_difree(tp, pag, ip->i_ino, &xic);
+        if (error)
+-               return error;
++               goto out;
+
+
+
+-                       z3fold_page_unlock(zhdr);
+                        clear_bit(PAGE_CLAIMED, &page->private);
++                       z3fold_page_unlock(zhdr);
+
+
+    jffs2: fix memory leak in jffs2_do_fill_super
+
+    If jffs2_iget() or d_make_root() in jffs2_do_fill_super() returns
+    an error, we can observe the following kmemleak report:
+
+    --------------------------------------------
+    unreferenced object 0xffff888105a65340 (size 64):
+      comm "mount", pid 710, jiffies 4302851558 (age 58.239s)
+      hex dump (first 32 bytes):
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+        00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+      backtrace:
+        [<ffffffff859c45e5>] kmem_cache_alloc_trace+0x475/0x8a0
+        [<ffffffff86160146>] jffs2_sum_init+0x96/0x1a0
+        [<ffffffff86140e25>] jffs2_do_mount_fs+0x745/0x2120
+        [<ffffffff86149fec>] jffs2_do_fill_super+0x35c/0x810
+        [<ffffffff8614aae9>] jffs2_fill_super+0x2b9/0x3b0
+        [...]
+    unreferenced object 0xffff8881bd7f0000 (size 65536):
+      comm "mount", pid 710, jiffies 4302851558 (age 58.239s)
+      hex dump (first 32 bytes):
+        bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb  ................
+        bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb  ................
+      backtrace:
+        [<ffffffff858579ba>] kmalloc_order+0xda/0x110
+        [<ffffffff85857a11>] kmalloc_order_trace+0x21/0x130
+        [<ffffffff859c2ed1>] __kmalloc+0x711/0x8a0
+        [<ffffffff86160189>] jffs2_sum_init+0xd9/0x1a0
+        [<ffffffff86140e25>] jffs2_do_mount_fs+0x745/0x2120
+        [<ffffffff86149fec>] jffs2_do_fill_super+0x35c/0x810
+        [<ffffffff8614aae9>] jffs2_fill_super+0x2b9/0x3b0
+        [...]
+    --------------------------------------------
+
+    This is because the resources allocated in jffs2_sum_init() are not
+    released. Call jffs2_sum_exit() to release these resources to solve
+    the problem.
+
+
+
+    +       for (i = 0; i < XLOG_BC_TABLE_SIZE; i++) {
++               struct xfs_buf_cancel   *bc;
++
++               while ((bc = list_first_entry_or_null(
++                               &log->l_buf_cancel_table[i],
++                               struct xfs_buf_cancel, bc_list))) {
++                       list_del(&bc->bc_list);
++                       kmem_free(bc);
++               }
++       }
+
+
+
++out_cancel:
++       xlog_free_buf_cancel_table(log);
+        return error;
+
+
+
+	-       struct xfs_btree_cur    *ncur;  /* new btree cursor */
++       struct xfs_btree_cur    *ncur = NULL;   /* new btree cursor */
+
+
+
+ error0:
++       if (ncur)
++               xfs_btree_del_cursor(ncur, error);
+        return error;
+
+
+	+       kfree(smu_table->gpu_metrics_table);
++       smu_table->gpu_metrics_table = NULL;
++
+
+
+-               blob = kmalloc(params.len, GFP_KERNEL_ACCOUNT);
++               blob = kzalloc(params.len, GFP_KERNEL_ACCOUNT);
+
+
+-// Copyright (c) 2022 Bytedance
++/* Copyright (c) 2022 Bytedance */
+
+
+
+
+-#define TEST_VALUE  1
+-
+ void test_map_lookup_percpu_elem(void)
+ {
+        struct test_map_lookup_percpu_elem *skel;
+-       int key = 0, ret;
+-       int nr_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+-       int *buf;
++       __u64 key = 0, sum;
++       int ret, i, nr_cpus = libbpf_num_possible_cpus();
++       __u64 *buf;
+
+-       buf = (int *)malloc(nr_cpus*sizeof(int));
++       buf = malloc(nr_cpus*sizeof(__u64));
+        if (!ASSERT_OK_PTR(buf, "malloc"))
+                return;
+-       memset(buf, 0, nr_cpus*sizeof(int));
+-       buf[0] = TEST_VALUE;
+
+-       skel = test_map_lookup_percpu_elem__open_and_load();
+-       if (!ASSERT_OK_PTR(skel, "test_map_lookup_percpu_elem__open_and_load"))
+-               return;
++       for (i = 0; i < nr_cpus; i++)
++               buf[i] = i;
++       sum = (nr_cpus - 1) * nr_cpus / 2;
++
++       skel = test_map_lookup_percpu_elem__open();
++       if (!ASSERT_OK_PTR(skel, "test_map_lookup_percpu_elem__open"))
++               goto exit;
++
++       skel->rodata->my_pid = getpid();
++       skel->rodata->nr_cpus = nr_cpus;
++
++       ret = test_map_lookup_percpu_elem__load(skel);
++       if (!ASSERT_OK(ret, "test_map_lookup_percpu_elem__load"))
++               goto cleanup;
++
+        ret = test_map_lookup_percpu_elem__attach(skel);
+-       ASSERT_OK(ret, "test_map_lookup_percpu_elem__attach");
++       if (!ASSERT_OK(ret, "test_map_lookup_percpu_elem__attach"))
++               goto cleanup;
+
+        ret = bpf_map_update_elem(bpf_map__fd(skel->maps.percpu_array_map), &key, buf, 0);
+        ASSERT_OK(ret, "percpu_array_map update");
+@@ -37,10 +45,14 @@ void test_map_lookup_percpu_elem(void)
+
+        syscall(__NR_getuid);
+
+-       ret = skel->bss->percpu_array_elem_val == TEST_VALUE &&
+-             skel->bss->percpu_hash_elem_val == TEST_VALUE &&
+-             skel->bss->percpu_lru_hash_elem_val == TEST_VALUE;
+-       ASSERT_OK(!ret, "bpf_map_lookup_percpu_elem success");
++       test_map_lookup_percpu_elem__detach(skel);
++
++       ASSERT_EQ(skel->bss->percpu_array_elem_sum, sum, "percpu_array lookup percpu elem");
++       ASSERT_EQ(skel->bss->percpu_hash_elem_sum, sum, "percpu_hash lookup percpu elem");
++       ASSERT_EQ(skel->bss->percpu_lru_hash_elem_sum, sum, "percpu_lru_hash lookup percpu elem");
+
++cleanup:
+        test_map_lookup_percpu_elem__destroy(skel);
++exit:
++       free(buf);
+ }
+
+
+ -       if (r && new && new->dirty_bitmap && old && !old->dirty_bitmap)
++       if (r && new && new->dirty_bitmap && (!old || !old->dirty_bitmap))
+
+
+-       if (ret)
++       if (ret) {
++               if (ret != -EPROBE_DEFER) {
++                       amba_device_put(dev);
++                       goto err_out;
++               }
+                goto err_release;
++       }
++
